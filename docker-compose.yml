@@ -1,7 +1,7 @@
 services:
   kiro-rs:
     build: .
-    image: huydepzai123454/kirors:latest
+    image: minhhn77/kirors:latest
     container_name: kiro-rs
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -10,3 +10,11 @@ services:
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
+    networks:
+      - default
+      - new-api-network
+
+networks:
+  new-api-network:
+    external: true
+    name: 123gateway_new-api-network
