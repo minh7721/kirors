@@ -10,3 +10,11 @@ services:
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
+    networks:
+      - default
+      - new-api-network
+
+networks:
+  new-api-network:
+    external: true
+    name: 123gateway_new-api-network
