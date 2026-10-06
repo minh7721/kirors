@@ -126,32 +126,57 @@ Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
-/// 按照用户要求：
+/// 优先级：5.5 > 4.6/4.5 > 5.0 > 默认
+/// - sonnet 5.5/5-5 → claude-sonnet-5.5
+/// - sonnet 5   → claude-sonnet-5
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
+/// - opus 5.5/5-5 → claude-opus-5.5
+/// - opus 5   → claude-opus-5
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
+    let m = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else {
-            Some("claude-sonnet-4.5".to_string())
+    if m.contains("sonnet") {
+        if m.contains("5-5") || m.contains("5.5") {
+            return Some("claude-sonnet-5.5".to_string());
         }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else {
-            Some("claude-opus-4.6".to_string())
+        if m.contains("4-6") || m.contains("4.6") {
+            return Some("claude-sonnet-4.6".to_string());
         }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
+        if m.contains("4-5") || m.contains("4.5") {
+            return Some("claude-sonnet-4.5".to_string());
+        }
+        // sonnet 5: e.g. "claude-sonnet-5", "claude-sonnet-5-20260101"
+        if m.contains("sonnet-5") || m.contains("sonnet 5") {
+            return Some("claude-sonnet-5".to_string());
+        }
+        return Some("claude-sonnet-4.5".to_string());
     }
+
+    if m.contains("opus") {
+        if m.contains("5-5") || m.contains("5.5") {
+            return Some("claude-opus-5.5".to_string());
+        }
+        if m.contains("4-5") || m.contains("4.5") {
+            return Some("claude-opus-4.5".to_string());
+        }
+        if m.contains("4-6") || m.contains("4.6") {
+            return Some("claude-opus-4.6".to_string());
+        }
+        if m.contains("opus-5") || m.contains("opus 5") {
+            return Some("claude-opus-5".to_string());
+        }
+        return Some("claude-opus-4.6".to_string());
+    }
+
+    if m.contains("haiku") {
+        return Some("claude-haiku-4.5".to_string());
+    }
+
+    None
 }
 
 /// 转换结果
