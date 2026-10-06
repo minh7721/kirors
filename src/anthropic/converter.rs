@@ -136,8 +136,24 @@ Complete all chunked operations without commentary.";
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
+///
+/// Khi `auto_haiku` bật và request là "đơn giản" (không thinking, không tool phức tạp),
+/// tự động route về haiku để tiết kiệm quota K12.
 pub fn map_model(model: &str) -> Option<String> {
+    map_model_with_haiku_routing(model, false, false)
+}
+
+pub fn map_model_with_haiku_routing(
+    model: &str,
+    auto_haiku: bool,
+    is_complex: bool,
+) -> Option<String> {
     let m = model.to_lowercase();
+
+    // Auto Haiku routing: request đơn giản + bật cờ thì ép về haiku
+    if auto_haiku && !is_complex && (m.contains("sonnet") || m.contains("opus")) {
+        return Some("claude-haiku-4.5".to_string());
+    }
 
     if m.contains("sonnet") {
         if m.contains("5-5") || m.contains("5.5") {
@@ -262,10 +278,20 @@ fn create_placeholder_tool(name: &str) -> Tool {
     }
 }
 
-/// 将 Anthropic 请求转换为 Kiro 请求
+/// 将 Anthropic 请求转换为 Kiro 请求 (wrapper giữ tương thích)
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
-    // 1. 映射模型
-    let model_id = map_model(&req.model)
+    convert_request_with_auto_haiku(req, false)
+}
+
+/// 将 Anthropic 请求转换为 Kiro 请求 (hỗ trợ auto Haiku routing)
+pub fn convert_request_with_auto_haiku(
+    req: &MessagesRequest,
+    auto_haiku: bool,
+) -> Result<ConversionResult, ConversionError> {
+    // 1. 映射模型 (có auto Haiku nếu bật)
+    let is_complex = req.thinking.as_ref().is_some_and(|t| t.is_enabled())
+        || req.tool_choice.is_some();
+    let model_id = map_model_with_haiku_routing(&req.model, auto_haiku, is_complex)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
 
     // 2. 检查消息列表
@@ -304,22 +330,19 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
-    // 6. 转换工具定义
-    let mut tools = convert_tools(&req.tools);
-
-    // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
+    // 6. 构建历史消息（先构建 để thu thập history_tool_names cho bước lọc tool）
     let mut history = build_history(req, messages, &model_id)?;
 
-    // 8. 验证并过滤 tool_use/tool_result 配对
+    // 7. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
 
-    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
+    // 8. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
 
-    // 9.5-9.6. 迭代清理：移除孤立 tool_result → 移除空消息对 → 可能产生新孤立 → 重复
+    // 8.5-8.6. 迭代清理：移除孤立 tool_result → 移除空消息对 → 可能产生新孤立 → 重复
     // 最多迭代 5 次防止无限循环
     for _ in 0..5 {
         let before_len = history.len();
@@ -330,18 +353,24 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // 9. 收集历史中使用的工具名称 — dùng cho cả lọc tool và tạo placeholder
+    let history_tool_names_vec = collect_history_tool_names(&history);
+    let history_tool_names_set: std::collections::HashSet<String> =
+        history_tool_names_vec.iter().cloned().collect();
+
+    // 10. 转换工具定义（có lọc thông minh dựa trên history + cache_control）
+    let mut tools = convert_tools_filtered(&req.tools, &history_tool_names_set);
+
+    // 11. 为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
-    // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
-    let history_tool_names = collect_history_tool_names(&history);
     let existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
-    for tool_name in history_tool_names {
+    for tool_name in &history_tool_names_vec {
         if !existing_tool_names.contains(&tool_name.to_lowercase()) {
-            tools.push(create_placeholder_tool(&tool_name));
+            tools.push(create_placeholder_tool(tool_name));
         }
     }
 
@@ -681,18 +710,48 @@ fn remove_empty_history_message_pairs(history: &mut Vec<Message>) {
     }
 }
 
-/// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
+/// 转换工具定义（带智能过滤：giảm token gửi lên Kiro）
+///
+/// Khi Claude Code gửi `cache_control` (prompt caching) trên một số tool,
+/// chỉ giữ lại: (1) tool có cache_control, (2) tool đã dùng trong history.
+/// Các tool chưa từng dùng và không được đánh dấu cache sẽ bị bỏ để tiết kiệm token.
+/// Nếu request không có bất kỳ cache_control nào, giữ nguyên tất cả tool (tương thích cũ).
+fn convert_tools_filtered(
+    tools: &Option<Vec<super::types::Tool>>,
+    history_tool_names: &std::collections::HashSet<String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
 
+    let has_any_cache_control = tools.iter().any(|t| t.cache_control.is_some());
+    // Chỉ lọc khi có cache_control và số lượng tool lớn (>12) để tránh ảnh hưởng request nhỏ
+    let should_filter = has_any_cache_control && tools.len() > 12;
+
+    let history_lower: std::collections::HashSet<String> =
+        history_tool_names.iter().map(|n| n.to_lowercase()).collect();
+
     tools
         .iter()
+        .filter(|t| {
+            if !should_filter {
+                return true;
+            }
+            // Giữ tool có cache_control hoặc đã dùng trong history
+            if t.cache_control.is_some() {
+                return true;
+            }
+            if history_lower.contains(&t.name.to_lowercase()) {
+                return true;
+            }
+            // Luôn giữ các tool cốt lõi mà Claude Code hay dùng
+            matches!(
+                t.name.as_str(),
+                "Read" | "Write" | "Edit" | "Bash" | "Grep" | "Glob" | "TodoWrite"
+            )
+        })
         .map(|t| {
             let mut description = t.description.clone();
-
-            // 对 Write/Edit 工具追加自定义描述后缀
             let suffix = match t.name.as_str() {
                 "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
                 "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
@@ -702,13 +761,10 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                 description.push('\n');
                 description.push_str(suffix);
             }
-
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
             let description = match description.char_indices().nth(10000) {
                 Some((idx, _)) => description[..idx].to_string(),
                 None => description,
             };
-
             Tool {
                 tool_specification: ToolSpecification {
                     name: t.name.clone(),
@@ -718,6 +774,11 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
             }
         })
         .collect()
+}
+
+/// 转换工具定义 (giữ lại cho tương thích test)
+fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
+    convert_tools_filtered(tools, &std::collections::HashSet::new())
 }
 
 /// 生成thinking标签前缀
@@ -771,8 +832,12 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            // 追加分块写入策略到系统消息 (idempotent)
+            let system_content = if system_content.contains("chunked operations") {
+                system_content
+            } else {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {

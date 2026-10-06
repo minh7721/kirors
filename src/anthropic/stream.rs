@@ -434,7 +434,9 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
+                        "output_tokens": output_tokens,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0
                     }
                 }),
             ));
@@ -528,7 +530,9 @@ impl StreamContext {
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": self.input_tokens,
-                    "output_tokens": 1
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
                 }
             }
         })

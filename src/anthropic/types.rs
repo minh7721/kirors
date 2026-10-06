@@ -152,6 +152,8 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
+                msg_type: None,
             }]))
         }
 
@@ -196,10 +198,22 @@ pub struct Message {
     pub content: serde_json::Value,
 }
 
+/// Cache control (Anthropic prompt caching)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+    /// 允许 `{"type":"text", ...}` 不报错
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
+    pub msg_type: Option<String>,
 }
 
 /// 工具定义
@@ -224,6 +238,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// Prompt caching
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl Tool {
@@ -258,6 +275,8 @@ pub struct ContentBlock {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 图片数据源

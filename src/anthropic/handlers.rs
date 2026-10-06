@@ -64,6 +64,34 @@ fn trim_oldest_messages(messages: &mut Vec<Message>) -> usize {
     2
 }
 
+/// Proactive trim: nếu số message vượt ngưỡng thì cắt bớt trước khi gọi Kiro,
+/// tránh tốn 1 request lỗi CONTENT_LENGTH_EXCEEDS_THRESHOLD.
+fn proactive_trim_if_needed(messages: &mut Vec<Message>) -> usize {
+    // Ngưỡng: > 30 messages thì chủ động cắt bớt 4 message cũ nhất
+    // 30 messages ~ 15 turn, thường đã ~80k-120k token với system+tools lặp lại
+    const PROACTIVE_THRESHOLD: usize = 30;
+    const PROACTIVE_TRIM_COUNT: usize = 4;
+    if messages.len() <= PROACTIVE_THRESHOLD {
+        return 0;
+    }
+    let start_idx = messages
+        .iter()
+        .position(|m| m.role != "system")
+        .unwrap_or(messages.len());
+    let max_removable = messages.len() - start_idx - 1;
+    if max_removable < PROACTIVE_TRIM_COUNT {
+        return 0;
+    }
+    // Cắt 4 message (2 cặp) cũ nhất
+    messages.drain(start_idx..start_idx + PROACTIVE_TRIM_COUNT);
+    tracing::info!(
+        "Proactive trim: removed {} oldest messages (remaining {})",
+        PROACTIVE_TRIM_COUNT,
+        messages.len()
+    );
+    PROACTIVE_TRIM_COUNT
+}
+
 /// Try to call the API, automatically trimming conversation history on context window overflow.
 ///
 /// On `CONTENT_LENGTH_EXCEEDS_THRESHOLD` error, trims the oldest messages and retries
@@ -77,10 +105,19 @@ async fn try_call_with_context_trim(
     profile_arn: &Option<String>,
     is_stream: bool,
 ) -> Result<(reqwest::Response, String, i32), Response> {
-    let mut total_trimmed: usize = 0;
+    // Proactive: cắt bớt history trước khi gọi, tránh tốn 1 request lỗi
+    let proactive = proactive_trim_if_needed(&mut payload.messages);
+    let mut total_trimmed: usize = proactive as usize;
+    // Auto Haiku routing: đọc từ config (nếu bật auto_haiku_routing trong config.json)
+    let auto_haiku = provider.token_manager().config().auto_haiku_routing;
     for attempt in 0..=MAX_CONTEXT_TRIM_RETRIES {
-        // Convert request
-        let conversion_result = match convert_request(payload) {
+        // Convert request (có thể tự route về Haiku nếu bật)
+        let raw_conversion = if auto_haiku {
+            crate::anthropic::converter::convert_request_with_auto_haiku(payload, true)
+        } else {
+            convert_request(payload)
+        };
+        let conversion_result = match raw_conversion {
             Ok(result) => result,
             Err(e) => {
                 let (error_type, message) = match &e {
@@ -735,7 +772,9 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
-    // 构建 Anthropic 响应
+    // Tính cache tokens để Claude Code hiển thị đúng (Kiro không có cache thật,
+    // nhưng báo đúng giúp client không tưởng nhầm và gửi lại full prompt)
+    // cache_read/cache_creation đều 0 vì Kiro tính theo AGENTIC_REQUEST, không theo token
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -746,7 +785,9 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
         }
     });
 

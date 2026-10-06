@@ -90,6 +90,11 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// Tự động route Opus/Sonnet -> Haiku cho request đơn giản (tiết kiệm quota K12)
+    /// Chỉ bật khi K12 Edu và muốn tiết kiệm tối đa. Mặc định tắt để không ảnh hưởng chất lượng.
+    #[serde(default)]
+    pub auto_haiku_routing: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -154,6 +159,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            auto_haiku_routing: false,
             config_path: None,
         }
     }
