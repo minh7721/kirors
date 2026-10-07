@@ -489,6 +489,9 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 是否收到过原生 reasoningContentEvent（5.x 模型）
+    /// 收到后文本不再按 `<thinking>` 标签解析
+    native_reasoning: bool,
 }
 
 impl StreamContext {
@@ -513,6 +516,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            native_reasoning: false,
         }
     }
 
@@ -582,6 +586,7 @@ impl StreamContext {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(&reasoning.text),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 // 公式: percentage * 200000 / 100 = percentage * 2000
@@ -632,6 +637,13 @@ impl StreamContext {
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
+        // 原生 reasoning 模式：thinking 已通过独立事件下发，文本直接输出
+        if self.native_reasoning {
+            let mut events = self.close_native_thinking_block();
+            events.extend(self.create_text_delta_events(content));
+            return events;
+        }
+
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
             return self.process_content_with_thinking(content);
@@ -640,6 +652,67 @@ impl StreamContext {
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
         self.create_text_delta_events(content)
+    }
+
+    /// 处理原生推理事件（reasoningContentEvent）
+    ///
+    /// 5.x 模型通过独立事件返回思考内容。客户端未启用 thinking 时直接丢弃，
+    /// 避免返回客户端未请求的 thinking 块。
+    fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
+        if !self.thinking_enabled || text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        if !self.native_reasoning {
+            self.native_reasoning = true;
+            // 若此前为探测 `<thinking>` 暂存了文本，先作为普通文本输出
+            if !self.thinking_buffer.is_empty() {
+                let buffered = std::mem::take(&mut self.thinking_buffer);
+                events.extend(self.create_text_delta_events(&buffered));
+            }
+        }
+
+        self.output_tokens += estimate_tokens(text);
+
+        // 当前没有打开的 thinking 块时新建一个
+        let index = match self.thinking_block_index {
+            Some(idx) if self.state_manager.is_block_open_of_type(idx, "thinking") => idx,
+            _ => {
+                let idx = self.state_manager.next_block_index();
+                self.thinking_block_index = Some(idx);
+                events.extend(self.state_manager.handle_content_block_start(
+                    idx,
+                    "thinking",
+                    json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": ""
+                        }
+                    }),
+                ));
+                idx
+            }
+        };
+
+        events.push(self.create_thinking_delta_event(index, text));
+        events
+    }
+
+    /// 关闭原生 reasoning 打开的 thinking 块（在输出 text / tool_use 之前调用）
+    fn close_native_thinking_block(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if let Some(idx) = self.thinking_block_index {
+            if self.state_manager.is_block_open_of_type(idx, "thinking") {
+                events.push(self.create_thinking_delta_event(idx, ""));
+                if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
+                    events.push(stop_event);
+                }
+            }
+        }
+        events
     }
 
     /// 处理包含thinking块的内容
@@ -871,6 +944,10 @@ impl StreamContext {
         let mut events = Vec::new();
 
         self.state_manager.set_has_tool_use(true);
+
+        if self.native_reasoning {
+            events.extend(self.close_native_thinking_block());
+        }
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -1895,5 +1972,107 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    /// 辅助函数：按顺序提取 content_block_start 的块类型
+    fn collect_block_types(events: &[SseEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| e.data["content_block"]["type"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    fn reasoning(text: &str) -> Event {
+        Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: text.to_string(),
+        })
+    }
+
+    #[test]
+    fn test_native_reasoning_then_text() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_kiro_event(&reasoning("Tôi cần ")));
+        all_events.extend(ctx.process_kiro_event(&reasoning("suy nghĩ")));
+        all_events.extend(ctx.process_assistant_response("Đáp án: 92"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_block_types(&all_events), vec!["thinking", "text"]);
+        assert_eq!(collect_thinking_content(&all_events), "Tôi cần suy nghĩ");
+        assert_eq!(collect_text_content(&all_events), "Đáp án: 92");
+
+        // thinking 块（index 0）必须在 text 块开始前关闭
+        let stop_pos = all_events
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"] == 0)
+            .expect("thinking block should be stopped");
+        let text_start_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            })
+            .unwrap();
+        assert!(stop_pos < text_start_pos);
+
+        let message_delta = all_events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_native_reasoning_text_not_parsed_as_thinking_tag() {
+        // 原生 reasoning 模式下，文本里出现 `<thinking>` 不应被当作 thinking 块
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_kiro_event(&reasoning("abc")));
+        all_events.extend(ctx.process_assistant_response("dùng tag <thinking>x</thinking>\n\nok"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_block_types(&all_events), vec!["thinking", "text"]);
+        assert_eq!(collect_thinking_content(&all_events), "abc");
+        assert_eq!(
+            collect_text_content(&all_events),
+            "dùng tag <thinking>x</thinking>\n\nok"
+        );
+    }
+
+    #[test]
+    fn test_native_reasoning_then_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_kiro_event(&reasoning("đọc file")));
+        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_block_types(&all_events), vec!["thinking", "tool_use"]);
+        let stop_pos = all_events
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"] == 0)
+            .unwrap();
+        let tool_start_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .unwrap();
+        assert!(stop_pos < tool_start_pos);
+    }
+
+    #[test]
+    fn test_native_reasoning_dropped_when_thinking_disabled() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_kiro_event(&reasoning("bí mật")));
+        all_events.extend(ctx.process_assistant_response("xin chào"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_block_types(&all_events), vec!["text"]);
+        assert_eq!(collect_thinking_content(&all_events), "");
+        assert_eq!(collect_text_content(&all_events), "xin chào");
     }
 }

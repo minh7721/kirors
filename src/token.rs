@@ -232,6 +232,9 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
             total += count_tokens(text) as i32;
         }
+        if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+            total += count_tokens(thinking) as i32;
+        }
         if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
             // 工具调用开销
             if let Some(input) = block.get("input") {

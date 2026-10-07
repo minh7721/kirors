@@ -504,7 +504,8 @@ pub async fn post_messages(
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(response, &payload.model, input_tokens).await
+        handle_non_stream_request(response, &payload.model, input_tokens, thinking_enabled)
+            .await
     }
 }
 
@@ -642,6 +643,7 @@ async fn handle_non_stream_request(
     response: reqwest::Response,
     model: &str,
     input_tokens: i32,
+    thinking_enabled: bool,
 ) -> Response {
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -666,6 +668,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    // 原生 reasoningContentEvent 的思考内容（5.x 模型）
+    let mut thinking_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -683,6 +687,11 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if thinking_enabled {
+                                thinking_content.push_str(&reasoning.text);
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -756,6 +765,13 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
+
+    if !thinking_content.is_empty() {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": thinking_content
+        }));
+    }
 
     if !text_content.is_empty() {
         content.push(json!({
@@ -938,7 +954,8 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(response, &payload.model, input_tokens).await
+        handle_non_stream_request(response, &payload.model, input_tokens, thinking_enabled)
+            .await
     }
 }
 
