@@ -926,21 +926,17 @@ impl MultiTokenManager {
 
     /// 将凭据列表回写到源文件
     ///
-    /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
+    /// 回写条件：
     /// - credentials_path 已设置
+    /// - 多凭据格式（数组）：回写整个数组
+    /// - 单凭据格式（对象）：回写唯一的那个凭据
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(false)` - 跳过写入（无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -962,8 +958,16 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        // 保持与源文件相同的格式：数组写数组，单对象写单对象
+        let json = if self.is_multiple_format {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        } else {
+            let single = credentials
+                .first()
+                .context("没有可回写的凭据")?
+                .clone();
+            serde_json::to_string_pretty(&single).context("序列化凭据失败")?
+        };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {

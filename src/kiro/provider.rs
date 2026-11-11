@@ -194,6 +194,15 @@ impl KiroProvider {
         );
         headers.insert(CONNECTION, HeaderValue::from_static("close"));
 
+        // 添加 profileArn header（如果存在）
+        // Kiro 使用 X-Kiro-Profile-Arn，同时兼容旧版 x-amzn-profile-arn
+        if let Some(profile_arn) = &ctx.credentials.profile_arn {
+            if let Ok(value) = HeaderValue::from_str(profile_arn) {
+                headers.insert("x-kiro-profile-arn", value.clone());
+                headers.insert("x-amzn-profile-arn", value);
+            }
+        }
+
         Ok(headers)
     }
 
@@ -238,6 +247,15 @@ impl KiroProvider {
             HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
         );
         headers.insert("Connection", HeaderValue::from_static("close"));
+
+        // 添加 profileArn header（如果存在）
+        // Kiro 使用 X-Kiro-Profile-Arn，同时兼容旧版 x-amzn-profile-arn
+        if let Some(profile_arn) = &ctx.credentials.profile_arn {
+            if let Ok(value) = HeaderValue::from_str(profile_arn) {
+                headers.insert("x-kiro-profile-arn", value.clone());
+                headers.insert("x-amzn-profile-arn", value);
+            }
+        }
 
         Ok(headers)
     }
@@ -307,6 +325,7 @@ impl KiroProvider {
             };
 
             let url = self.mcp_url_for(&ctx.credentials);
+
             let headers = match self.build_mcp_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -438,7 +457,13 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.base_url_for(&ctx.credentials);
+            let mut url = self.base_url_for(&ctx.credentials);
+
+            // 添加 profileArn 查询参数（如果存在）
+            if let Some(profile_arn) = &ctx.credentials.profile_arn {
+                url.push_str(&format!("?profileArn={}", urlencoding::encode(profile_arn)));
+            }
+
             let headers = match self.build_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
