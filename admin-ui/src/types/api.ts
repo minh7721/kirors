@@ -64,6 +64,7 @@ export interface AddCredentialRequest {
   authMethod?: 'social' | 'idc'
   clientId?: string
   clientSecret?: string
+  profileArn?: string
   priority?: number
   authRegion?: string
   apiRegion?: string

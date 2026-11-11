@@ -962,11 +962,13 @@ impl MultiTokenManager {
         let json = if self.is_multiple_format {
             serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
         } else {
-            let single = credentials
-                .first()
-                .context("没有可回写的凭据")?
-                .clone();
-            serde_json::to_string_pretty(&single).context("序列化凭据失败")?
+            match credentials.first() {
+                Some(single) => {
+                    serde_json::to_string_pretty(single).context("序列化凭据失败")?
+                }
+                // 单对象格式下凭据被全部删除：写回空数组，避免 {} 被解析成一个空凭据
+                None => "[]".to_string(),
+            }
         };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）

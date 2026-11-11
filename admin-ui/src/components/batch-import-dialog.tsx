@@ -23,6 +23,7 @@ interface CredentialInput {
   refreshToken: string
   clientId?: string
   clientSecret?: string
+  profileArn?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -183,6 +184,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,
+            profileArn: cred.profileArn?.trim() || undefined,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
           })

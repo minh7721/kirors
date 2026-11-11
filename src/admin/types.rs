@@ -88,6 +88,9 @@ pub struct AddCredentialRequest {
     /// OIDC Client Secret（IdC 认证需要）
     pub client_secret: Option<String>,
 
+    /// Profile ARN（Builder ID / IdC 账号必填，否则 API 返回 400）
+    pub profile_arn: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
